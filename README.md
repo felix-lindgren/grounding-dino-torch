@@ -30,7 +30,7 @@ from GDINOtorch import GroundingDINO, build_caption
 model = GroundingDINO("tiny").eval().cuda()  # or "base"
 
 image = Image.open("photo.jpg")
-pixel_values, pixel_mask = model.preprocess_image(image)
+pixel_values, pixel_mask = model.preprocess_image(image)  # on the model's device
 
 phrases = ["a cat", "a remote control"]
 caption, spans = build_caption(phrases)          # "a cat. a remote control."

@@ -11,8 +11,10 @@ safetensors of ``IDEA-Research/grounding-dino-{tiny,base}`` and of the
 import json
 import math
 import re
+import warnings
 from typing import NamedTuple, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -908,7 +910,7 @@ class GroundingDINO(nn.Module):
 
     # ------------------------------------------------------------------ inputs
 
-    def preprocess_image(self, image, size=800, max_size=1333):
+    def preprocess_image(self, image, size=800, max_size=1333, device=None):
         """Resize, normalize and pad one or more images into a batch.
 
         Accepts a PIL image, a file path, a ``[3, H, W]`` uint8 tensor, or a
@@ -916,32 +918,49 @@ class GroundingDINO(nn.Module):
         ``size`` (long side capped at ``max_size``), then the batch is
         zero-padded bottom/right to a common size.
 
+        Resizing stays on the CPU, in torchvision's uint8 path (the GPU's float
+        resize rounds ~1 grey level differently); the batch is then moved to
+        ``device`` as uint8 and normalized there, a quarter of the transfer.
+
         Returns ``pixel_values`` ``[B, 3, H, W]`` and ``pixel_mask`` ``[B, H, W]``
-        (bool, True on real pixels).
+        (bool, True on real pixels), on ``device`` (default: the model's).
         """
         images = image if isinstance(image, (list, tuple)) else [image]
-        tensors = [self._resize_normalize(img, size, max_size) for img in images]
-        height = max(t.shape[-2] for t in tensors)
-        width = max(t.shape[-1] for t in tensors)
-        pixel_values = torch.zeros(len(tensors), 3, height, width)
-        pixel_mask = torch.zeros(len(tensors), height, width, dtype=torch.bool)
-        for i, t in enumerate(tensors):
-            pixel_values[i, :, : t.shape[-2], : t.shape[-1]] = t
+        device = torch.device(device) if device is not None else self.level_embed.device
+        resized = [self._resize(img, size, max_size) for img in images]
+        height = max(t.shape[-2] for t in resized)
+        width = max(t.shape[-1] for t in resized)
+        pixels = torch.zeros(len(resized), 3, height, width, dtype=torch.uint8, pin_memory=device.type == "cuda")
+        pixel_mask = torch.zeros(len(resized), height, width, dtype=torch.bool, device=device)
+        for i, t in enumerate(resized):
+            pixels[i, :, : t.shape[-2], : t.shape[-1]] = t
             pixel_mask[i, : t.shape[-2], : t.shape[-1]] = True
-        return pixel_values, pixel_mask
+        pixels = pixels.to(device, non_blocking=True)
+        # A tensor divisor keeps CUDA from multiplying by a rounded 1/255
+        # instead, so the result is bit-identical to normalizing on the CPU.
+        pixel_values = TF.normalize(
+            pixels.float().div_(torch.tensor(255.0, device=device)), IMAGENET_MEAN, IMAGENET_STD
+        )
+        return pixel_values.masked_fill_(~pixel_mask[:, None], 0.0), pixel_mask
 
     @staticmethod
-    def _resize_normalize(image, size, max_size):
+    def _resize(image, size, max_size):
         if isinstance(image, str):
             image = Image.open(image)
         if isinstance(image, Image.Image):
-            image = TF.pil_to_tensor(image.convert("RGB"))
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            # Viewing PIL's buffer skips the copy (and fresh-page faults) that
+            # pil_to_tensor pays, 7x slower on a 4K frame. It is only read,
+            # so torch's warning about it being read-only doesn't apply.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+                image = torch.from_numpy(np.asarray(image)).permute(2, 0, 1)
         height, width = image.shape[-2:]
-        image = TF.resize(
-            image, list(resize_shape(height, width, size, max_size)),
+        return TF.resize(
+            image.cpu(), list(resize_shape(height, width, size, max_size)),
             interpolation=TF.InterpolationMode.BILINEAR, antialias=True,
         )
-        return TF.normalize(image.float() / 255.0, IMAGENET_MEAN, IMAGENET_STD)
 
     def tokenize(self, captions):
         """Tokenize caption(s); returns ``input_ids``, ``attention_mask`` ``[B, L]``."""

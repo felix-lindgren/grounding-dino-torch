@@ -149,6 +149,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pillow" },
     { name = "safetensors" },
     { name = "tokenizers" },
@@ -166,6 +168,7 @@ trt = [
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.25.0" },
+    { name = "numpy" },
     { name = "onnx", marker = "extra == 'trt'", specifier = ">=1.15.0" },
     { name = "onnxsim", marker = "extra == 'trt'", specifier = ">=0.6.3" },
     { name = "pillow", specifier = ">=10.0" },
