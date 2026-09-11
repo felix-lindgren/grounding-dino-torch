@@ -1,0 +1,39 @@
+[project]
+name = "GDINOtorch"
+version = "0.1.0"
+description = "Standalone PyTorch Grounding DINO (Swin-T/B + BERT), loading the HF checkpoints without transformers"
+readme = "README.md"
+authors = [
+    { name = "Felix Lindgren", email = "lindgren.felix@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.25.0",
+    "tokenizers>=0.15.0",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+trt = [
+    # TensorRT 11 drops weakly typed builds (BuilderFlag.FP16); stay on 10.x.
+    "tensorrt>=10.0.0,<11; (sys_platform == 'win32' or sys_platform == 'linux') and platform_machine == 'x86_64'",
+    "onnx>=1.15.0",
+    "onnxsim>=0.6.3",
+]
+
+# Use NVIDIA's PyPI index for TensorRT wheels. ``explicit = true`` restricts it
+# to packages that explicitly opt in below, so normal PyPI deps are unaffected.
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+tensorrt = { index = "nvidia" }
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
