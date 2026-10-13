@@ -7,8 +7,8 @@ at 800x1333 and 256 tokens, ~1.5 GiB for tiny/base plus ~0.17 GiB per image
 of ``max_batch``, and ~4.6 GiB plus ~0.3 GiB per image for Swin-L. Batching
 barely raises throughput (0-7% per image), so keep ``max_batch`` small.
 
-Requires TensorRT 10: TensorRT 11 drops weakly typed networks, and with them
-``BuilderFlag.FP16``.
+Requires TensorRT 11, which builds every network strongly typed: precision
+comes from the ONNX, so build an fp16 engine from an ``export.py --fp16`` ONNX.
 """
 
 import argparse
@@ -33,13 +33,12 @@ def build_engine(
     opt_text_len: int = DEFAULT_OPT_TEXT_LEN,
     max_text_len: int = DEFAULT_MAX_TEXT_LEN,
     workspace_gb: int = DEFAULT_WORKSPACE_GB,
-    fp16: bool = True,
     tf32: bool = True,
 ):
     """Build and save the engine; returns its path, or None on failure.
 
-    ``tf32`` (TensorRT's default) speeds up the layers left in fp32 at a small
-    accuracy cost: an fp32 engine drifts ~0.004 in score with it, ~0.002 without.
+    ``tf32`` (TensorRT's default) speeds up the layers the ONNX keeps in fp32 at
+    a small accuracy cost: an fp32 engine drifts ~0.004 in score with it, ~0.002 without.
     """
     logger = trt.Logger(trt.Logger.WARNING)
     trt.init_libnvinfer_plugins(logger, "")  # registers MultiscaleDeformableAttnPlugin_TRT
@@ -55,8 +54,6 @@ def build_engine(
     config = builder.create_builder_config()
     # Workspace is a ceiling, not a reservation; larger -> more tactics considered.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
-    if fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
     if not tf32:
         config.clear_flag(trt.BuilderFlag.TF32)
 
@@ -96,7 +93,6 @@ def _parse_args():
     p.add_argument("--opt-text-len", type=int, default=DEFAULT_OPT_TEXT_LEN)
     p.add_argument("--max-text-len", type=int, default=DEFAULT_MAX_TEXT_LEN)
     p.add_argument("--workspace-gb", type=int, default=DEFAULT_WORKSPACE_GB)
-    p.add_argument("--no-fp16", action="store_true")
     p.add_argument("--no-tf32", action="store_true")
     return p.parse_args()
 
@@ -112,7 +108,6 @@ if __name__ == "__main__":
         opt_text_len=args.opt_text_len,
         max_text_len=args.max_text_len,
         workspace_gb=args.workspace_gb,
-        fp16=not args.no_fp16,
         tf32=not args.no_tf32,
     )
     if engine:

@@ -11,6 +11,12 @@ engine serves any vocabulary. Deformable attention is exported as TensorRT's
 fused ``MultiscaleDeformableAttnPlugin_TRT`` instead of four ``GridSample`` per
 layer, about 10x faster in the engine; the ONNX therefore only runs under
 TensorRT, not onnxruntime.
+
+TensorRT 11 builds every network strongly typed: each layer runs in the type
+the ONNX gives it, and there is no builder flag to lower precision. An fp16
+engine therefore needs an fp16 ONNX, which ``fp16=True`` traces under
+``torch.autocast`` so the graph carries autocast's casts (fp16 matmuls and
+convolutions, fp32 normalization, softmax and position embeddings).
 """
 
 import argparse
@@ -56,6 +62,10 @@ class _DeformableAttentionPlugin(torch.autograd.Function):
 
 
 def _plugin_deformable_attention(value, spatial_shapes_list, sampling_locations, attention_weights):
+    # The plugin takes its three float inputs in one type; under autocast the
+    # sampling locations come out fp32 while value is fp16.
+    sampling_locations = sampling_locations.to(value.dtype)
+    attention_weights = attention_weights.to(value.dtype)
     sizes = [h * w for h, w in spatial_shapes_list]
     spatial_shapes = torch.tensor(spatial_shapes_list, dtype=torch.int32, device=value.device)
     level_start_index = torch.tensor(
@@ -87,7 +97,9 @@ class ImagePath(nn.Module):
                 text_position_ids):
         text = TextFeatures(text_features, text_token_mask, text_self_attn_mask, text_position_ids)
         # Called unbound, so a TensorRT subclass's override is not what gets traced.
-        return GroundingDINO.forward_object_detection_from_text(self.model, pixel_values, text, pixel_mask)
+        logits, boxes = GroundingDINO.forward_object_detection_from_text(self.model, pixel_values, text, pixel_mask)
+        # Outputs stay fp32 whatever precision the graph runs in.
+        return logits.float(), boxes.float()
 
 
 def export_image_path(
@@ -96,17 +108,21 @@ def export_image_path(
     image_size: tuple[int, int] = (800, 1333),
     device: str | torch.device | None = None,
     simplify: bool = False,
+    fp16: bool = False,
 ):
     """Trace ``model``'s image path at ``image_size`` (h, w) and write it to ``onnx_path``.
 
     Tracing runs on ``device`` (CUDA when available), keeping the trace's
-    activations off host RAM; the model is moved back afterwards. ``simplify``
+    activations off host RAM; the model is moved back afterwards. ``fp16``
+    traces under CUDA fp16 autocast, for an fp16 engine. ``simplify``
     runs onnx-simplifier, which TensorRT does not need (it folds constants
     itself) and which takes minutes on the larger models.
     """
     height, width = image_size
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if fp16 and torch.device(device).type != "cuda":
+        raise ValueError("An fp16 export traces under CUDA autocast and needs a CUDA device.")
     original_device = next(model.parameters()).device
     was_training = model.training
     model.eval().to(device)
@@ -119,7 +135,7 @@ def export_image_path(
             text = model.encode_text(input_ids.to(device), attention_mask.to(device))
             pixel_values = torch.randn(1, 3, height, width, device=device)
             pixel_mask = torch.ones(1, height, width, dtype=torch.bool, device=device)
-            with _deformable_attention_as_plugin():
+            with _deformable_attention_as_plugin(), torch.autocast("cuda", torch.float16, enabled=fp16):
                 torch.onnx.export(
                     ImagePath(model),
                     (pixel_values, pixel_mask, *text),
@@ -168,10 +184,13 @@ def _parse_args():
     p.add_argument("--onnx", default="gdino_image.onnx")
     p.add_argument("--image-size", type=int, nargs=2, default=(800, 1333), metavar=("H", "W"))
     p.add_argument("--simplify", action="store_true")
+    p.add_argument("--fp16", action="store_true", help="export for an fp16 engine (needs CUDA)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    export_image_path(GroundingDINO(args.model_type), args.onnx, tuple(args.image_size), simplify=args.simplify)
+    export_image_path(
+        GroundingDINO(args.model_type), args.onnx, tuple(args.image_size), simplify=args.simplify, fp16=args.fp16
+    )
     print(f"Exported {args.onnx}")

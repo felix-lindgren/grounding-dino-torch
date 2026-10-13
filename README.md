@@ -79,12 +79,12 @@ at 800x1066 runs in about 165 ms/image under autocast, on par with the
 `GroundingDINOTRT` is a drop-in `GroundingDINO` that runs everything after the
 text tower (Swin, fusion encoder, query selection, decoder) as one TensorRT
 engine. BERT stays in PyTorch, so `encode_text` and caption reuse work as
-above. Install the extra first (`uv sync --extra trt`, TensorRT 10.x).
+above. Install the extra first (`uv sync --extra trt`, TensorRT 11+).
 
 ```python
 from GDINOtorch import GroundingDINOTRT
 
-# Exports <output_dir>/gdino_tiny_800x1333.onnx and builds
+# Exports <output_dir>/gdino_tiny_800x1333_fp16.onnx and builds
 # gdino_tiny_800x1333_fp16.engine on first use (~2-4 min), then reuses them.
 model = GroundingDINOTRT("tiny", output_dir="trt_engines", image_size=(800, 1333)).eval().cuda()
 pred_logits, pred_boxes = model(pixel_values.cuda(), input_ids.cuda(), attention_mask.cuda(), pixel_mask.cuda())
@@ -112,7 +112,9 @@ image checked, large's top detection moved by 0.02 (autocast: 0.002), so check
 large on your own eval before relying on it. `fp16=False` builds an fp32
 engine (TF32 on by default; `tf32=False` matches PyTorch fp32 within ~0.002).
 The standalone steps are `python -m GDINOtorch.torch_version.export` and
-`python -m GDINOtorch.torch_version.build_engine`.
+`python -m GDINOtorch.torch_version.build_engine`. TensorRT 11 builds every
+network strongly typed, so precision is set at export: `export --fp16` traces
+under fp16 autocast, and the engine keeps the ONNX's types.
 
 ## Model variants
 

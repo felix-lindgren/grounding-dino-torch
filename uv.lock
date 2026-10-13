@@ -173,7 +173,7 @@ requires-dist = [
     { name = "onnxsim", marker = "extra == 'trt'", specifier = ">=0.6.3" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "safetensors", specifier = ">=0.4.0" },
-    { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trt') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'trt')", specifier = ">=10.0.0,<11", index = "https://pypi.nvidia.com/" },
+    { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trt') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'trt')", specifier = ">=11.0.0", index = "https://pypi.nvidia.com/" },
     { name = "tokenizers", specifier = ">=0.15.0" },
     { name = "torch", specifier = ">=2.1.0" },
     { name = "torchvision", specifier = ">=0.16.0" },
@@ -1041,41 +1041,43 @@ wheels = [
 
 [[package]]
 name = "tensorrt"
-version = "10.16.1.11"
+version = "11.4.0.106"
 source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
     { name = "tensorrt-cu13" },
 ]
-sdist = { url = "https://pypi.nvidia.com/tensorrt/tensorrt-10.16.1.11.tar.gz", hash = "sha256:5c31ef98e1a1b53197acc600327d6b1e4abb503024119a2e66f21a5654ea3996" }
+sdist = { url = "https://pypi.nvidia.com/tensorrt/tensorrt-11.4.0.106.tar.gz", hash = "sha256:5cba2c13470b578788ca4a344e53dc7a9fdfe7aba78673a8d4849e8af13b54f5" }
 
 [[package]]
 name = "tensorrt-cu13"
-version = "10.16.1.11"
+version = "11.4.0.106"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "tensorrt-cu13-bindings" },
     { name = "tensorrt-cu13-libs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7c/9a/dfe6c293faa625457563c293d165f8948532d71b29a490e4f59773edf2aa/tensorrt_cu13-10.16.1.11.tar.gz", hash = "sha256:5d34203a92f38851b150c4eddd32b9b55c01fd40fc4d19bff83e8dfef1d8f69e", size = 17916, upload-time = "2026-04-07T19:37:15.536Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/df/a0044af5a9becb484004fcbfb9bf91758ae7bc42dc85a5a91dd30d0c420a/tensorrt_cu13-11.4.0.106.tar.gz", hash = "sha256:ae8489f9e0b9593eaa67ced3422864f5d5d597bbcb2caafb58f8afb293977271", size = 17970, upload-time = "2026-10-08T18:46:38.79Z" }
 
 [[package]]
 name = "tensorrt-cu13-bindings"
-version = "10.16.1.11"
+version = "11.4.0.106"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/25/c9118b04afb96e0cd4d492199d9b476de9c0087b2e406c34515f0c7458d1/tensorrt_cu13_bindings-10.16.1.11-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:f986d47980d042cc126506a9b84586e55ad13737a7a46826fe45457c04d66294", size = 1346363, upload-time = "2026-04-07T19:39:58.905Z" },
-    { url = "https://files.pythonhosted.org/packages/fa/d5/2595b547ab7228f7c424b6901b59f90360006a537603c13417c30b3bcc3c/tensorrt_cu13_bindings-10.16.1.11-cp311-none-win_amd64.whl", hash = "sha256:483a58b8cf3a7e97d66d7245084d08f9ee9cd19d09210305ed43b34fbb721f7c", size = 963765, upload-time = "2026-04-07T19:38:58.426Z" },
-    { url = "https://files.pythonhosted.org/packages/76/6d/d46fd241895091d11d0e55a389abc5711c71892e8e63b03e272e61ca880a/tensorrt_cu13_bindings-10.16.1.11-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:2fb87ac24a5e5f42e43f283c16d1b661dc72ef18568fd847ce2080b7db9ca232", size = 1341248, upload-time = "2026-04-07T19:42:10.807Z" },
-    { url = "https://files.pythonhosted.org/packages/e9/a8/dfda48ab992050f40d0b2da7a795f16db403f48ee89e6a526cbd00133445/tensorrt_cu13_bindings-10.16.1.11-cp312-none-win_amd64.whl", hash = "sha256:70ca2d73301ff427104d7986c26d5fa56f6a91578242d20e82b37c139be14ec0", size = 964883, upload-time = "2026-04-07T19:44:07.702Z" },
-    { url = "https://files.pythonhosted.org/packages/58/41/0b6f0d81862b058393cd0b5616e11d1826c8e02b14294dabcaee92ce4365/tensorrt_cu13_bindings-10.16.1.11-cp313-none-manylinux_2_28_x86_64.whl", hash = "sha256:da17c222ba99f46e77e1dab568cd17c4652b0432d4fae074e4c79285356aa0ac", size = 1341149, upload-time = "2026-04-07T19:39:15.597Z" },
-    { url = "https://files.pythonhosted.org/packages/f7/e8/f6e4bcd9656bfdae64366606b386b5963035ac5fb01d83ccfccd97432a7a/tensorrt_cu13_bindings-10.16.1.11-cp313-none-win_amd64.whl", hash = "sha256:44b44154027e5e9e39d74e14b453704af50ba774b3775704f6d40408c8457526", size = 964906, upload-time = "2026-04-07T19:43:16.083Z" },
+    { url = "https://files.pythonhosted.org/packages/84/21/6b207a89937f6dfffa82eec24bcedaa6a66db0347c8d668f45586b5dbcf6/tensorrt_cu13_bindings-11.4.0.106-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:d072ac2a095e2be749fefc847adfb25d5ebe70303401df62ede8fe67a59f27fc", size = 1260589, upload-time = "2026-10-08T18:48:37.465Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/80/49e2f300f16e8de22b5b84db2a552a1a82ac7c90a6db13960a54a1d17dc6/tensorrt_cu13_bindings-11.4.0.106-cp311-none-win_amd64.whl", hash = "sha256:92cd3e441084dd9c7944a4d9a09d24042a2c794d1266934e6b5316b93a8ee3d9", size = 896066, upload-time = "2026-10-08T18:49:21.607Z" },
+    { url = "https://files.pythonhosted.org/packages/60/b6/f1a28d45bc43d98954381a14417b4254f8c96fbd7813427776feb8b20f21/tensorrt_cu13_bindings-11.4.0.106-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:5fc7a6c412881f7212030893bd5531b1a0ff415c72c7678dfe4ead7a7765b38d", size = 1261182, upload-time = "2026-10-08T18:50:04.596Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/93/9ea63e5161fb60fff9b4b678ff665b712cd562264cc743c2733584a37420/tensorrt_cu13_bindings-11.4.0.106-cp312-none-win_amd64.whl", hash = "sha256:29f4a027db683f5b86824cc7df79d357a1b6f3b8401761ef6497c1ae81f21dc3", size = 895997, upload-time = "2026-10-08T18:50:51.96Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/f6/5083877a6aa6395c7362cc6f42e67d085f9ffe0bead9d9949110c2cb555a/tensorrt_cu13_bindings-11.4.0.106-cp313-none-manylinux_2_28_x86_64.whl", hash = "sha256:bac9a362c9189b5f5dd0444213913846e4b46003237834958e890eff57d86ed5", size = 1262506, upload-time = "2026-10-08T18:51:34.671Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/c5/f091173571ba742c602d00f92d2cede23bdd7831f91f3455c4042b3e3fb0/tensorrt_cu13_bindings-11.4.0.106-cp313-none-win_amd64.whl", hash = "sha256:9a6027837063208e5f9239640bd7b8f5fad525ab99323a6e8337f091538d6fad", size = 895980, upload-time = "2026-10-08T18:52:19.987Z" },
+    { url = "https://files.pythonhosted.org/packages/be/43/6fd7f0d80da5df9cf45373d76d35acff69e8946dff0e63724eef50e76f14/tensorrt_cu13_bindings-11.4.0.106-cp314-none-manylinux_2_28_x86_64.whl", hash = "sha256:233f5f02af7940b7cf15a5b526fc16b203d93181473a58588937bf401ca1d293", size = 1267097, upload-time = "2026-10-08T18:53:04.109Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/06/c6cc38db4608415dfa07c7bfc147fa3dbb181943e6f13158f44db2278eb9/tensorrt_cu13_bindings-11.4.0.106-cp314-none-win_amd64.whl", hash = "sha256:b5e2f99fbb5e7279479317f08f42b98b2ecedc1eff8413c4be57bdb91b2b317f", size = 896926, upload-time = "2026-10-08T18:53:49.002Z" },
 ]
 
 [[package]]
 name = "tensorrt-cu13-libs"
-version = "10.16.1.11"
+version = "11.4.0.106"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/67/25/085bcc297237bfea56fac62cca0439f2298f875b6a26de5ae0413671687d/tensorrt_cu13_libs-10.16.1.11.tar.gz", hash = "sha256:0e86cd02321b7258c2521495a7d8f0591852e6966ed7e43cfe33640c737495a3", size = 15737, upload-time = "2026-04-07T19:38:09.175Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/a0/328dd4e184ec6e3296a1676a2f7c2d014faf53c32339f3dd4f358ddeb1b1/tensorrt_cu13_libs-11.4.0.106.tar.gz", hash = "sha256:fc29af15a9bb5489567a58a98a56d457de64c16ab3c8ea010ef21447ff29bbea", size = 15508, upload-time = "2026-10-08T18:48:37.773Z" }
 
 [[package]]
 name = "tokenizers"

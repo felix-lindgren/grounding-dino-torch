@@ -47,7 +47,7 @@ if TRT_AVAILABLE:
     }
 
     class TRTRunner:
-        """Minimal TensorRT 10 runtime for a serialized engine, on torch tensors.
+        """Minimal TensorRT 11 runtime for a serialized engine, on torch tensors.
 
         TensorRT allocates the context's scratch memory itself, once, for the
         largest shapes in the engine's profile, outside torch's caching
@@ -64,7 +64,10 @@ if TRT_AVAILABLE:
                 with open(engine_path, "rb") as f:
                     self.engine = self.runtime.deserialize_cuda_engine(f.read())
                 if self.engine is None:
-                    raise RuntimeError(f"Failed to deserialize TRT engine: {engine_path}")
+                    raise RuntimeError(
+                        f"Failed to deserialize TRT engine: {engine_path}. Engines only load in the "
+                        "TensorRT version and on the GPU they were built for; delete it to rebuild."
+                    )
                 self.context = self.engine.create_execution_context()
                 if self.context is None:  # its scratch may be sitting in torch's cache
                     torch.cuda.empty_cache()
@@ -147,7 +150,11 @@ class GroundingDINOTRT(GroundingDINO):
         tf32: bool = True,
         simplify: bool = False,
     ):
-        """``image_size`` is the engine's fixed (h, w); ignored when loading an existing engine."""
+        """``image_size`` is the engine's fixed (h, w); ignored when loading an existing engine.
+
+        ``fp16`` exports an fp16 ONNX (TensorRT 11 takes precision from the
+        graph), so fp16 and fp32 engines each have their own ONNX.
+        """
         self.output_dir = Path(output_dir)
         self.image_size = tuple(image_size)
         precision = "fp16" if fp16 else ("tf32" if tf32 else "fp32")
@@ -158,8 +165,9 @@ class GroundingDINOTRT(GroundingDINO):
         )
         self.onnx_path = (
             Path(onnx_path) if onnx_path is not None
-            else self.output_dir / f"{artifact_stem}.onnx"
+            else self.output_dir / f"{artifact_stem}{'_fp16' if fp16 else ''}.onnx"
         )
+        self.fp16 = fp16
         self.build_missing = build_missing
         self.simplify = simplify
         self.engine_build_kwargs = {
@@ -168,7 +176,6 @@ class GroundingDINOTRT(GroundingDINO):
             "max_batch": max_batch,
             "opt_text_len": opt_text_len,
             "workspace_gb": workspace_gb,
-            "fp16": fp16,
             "tf32": tf32,
         }
         self.trt = None
@@ -185,7 +192,10 @@ class GroundingDINOTRT(GroundingDINO):
             from GDINOtorch.torch_version.export import export_image_path
 
             print(f"Exporting Grounding DINO image-path ONNX to {self.onnx_path}")
-            export_image_path(self, self.onnx_path, self.image_size, simplify=self.simplify)
+            if self.fp16 and not torch.cuda.is_available():
+                print("CUDA is not available; an fp16 ONNX needs it to export, so nothing was built.")
+                return
+            export_image_path(self, self.onnx_path, self.image_size, simplify=self.simplify, fp16=self.fp16)
 
         if not TRT_AVAILABLE:
             print("TensorRT is not installed; ONNX was exported but engine build was skipped.")
