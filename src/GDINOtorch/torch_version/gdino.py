@@ -445,6 +445,12 @@ def phrase_masks_and_positions(input_ids: torch.Tensor) -> tuple[torch.Tensor, t
 # ---------------------------------------------------------------------------
 
 
+try:  # fused fwd+bwd kernel; only taken when gradients are needed (training), inference is unchanged
+    from .msda_triton import multi_scale_deformable_attention_triton as _msda_triton
+except ImportError:
+    _msda_triton = None
+
+
 def multi_scale_deformable_attention(value, spatial_shapes_list, sampling_locations, attention_weights):
     """Pure-PyTorch MSDeformAttn: bilinear-sample each level, then weight and sum.
 
@@ -452,6 +458,10 @@ def multi_scale_deformable_attention(value, spatial_shapes_list, sampling_locati
     points, 2] in [0, 1]; attention_weights: [B, Q, heads, levels, points].
     Returns [B, Q, heads * head_dim].
     """
+    if _msda_triton is not None and value.is_cuda and torch.is_grad_enabled() and (
+        value.requires_grad or sampling_locations.requires_grad or attention_weights.requires_grad
+    ):
+        return _msda_triton(value, spatial_shapes_list, sampling_locations, attention_weights)
     batch_size, _, num_heads, head_dim = value.shape
     _, num_queries, _, num_levels, num_points, _ = sampling_locations.shape
     value_list = value.split([h * w for h, w in spatial_shapes_list], dim=1)
