@@ -113,8 +113,9 @@ class _MSDA(torch.autograd.Function):
         shapes, starts = _level_tensors(spatial_shapes_list, value.device)
         out = torch.empty(B, Q, H, D, device=value.device, dtype=value.dtype)
         N = B * Q * H
-        _fwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, out, N, Q * H, S, H,
-                                              L=L, P=P, D=D, BLOCK=BLOCK)
+        with torch.cuda.device(value.device):  # Triton launches on the current device
+            _fwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, out, N, Q * H, S, H,
+                                                  L=L, P=P, D=D, BLOCK=BLOCK)
         ctx.save_for_backward(value, loc, wt)
         ctx.shapes = spatial_shapes_list
         return out.view(B, Q, H * D)
@@ -129,8 +130,9 @@ class _MSDA(torch.autograd.Function):
         gvalue = torch.zeros(value.shape, device=value.device, dtype=torch.float32)
         gloc, gwt = torch.empty_like(loc), torch.empty_like(wt)
         N = B * Q * H
-        _bwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, gout.contiguous(), gvalue, gloc, gwt,
-                                              N, Q * H, S, H, L=L, P=P, D=D, BLOCK=BLOCK)
+        with torch.cuda.device(value.device):
+            _bwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, gout.contiguous(), gvalue, gloc,
+                                                  gwt, N, Q * H, S, H, L=L, P=P, D=D, BLOCK=BLOCK)
         return gvalue.to(value.dtype), None, gloc, gwt
 
 
