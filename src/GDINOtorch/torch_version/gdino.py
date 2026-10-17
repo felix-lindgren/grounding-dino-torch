@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import torchvision.transforms.v2.functional as TF
 from PIL import Image
 from safetensors import safe_open
@@ -641,6 +642,8 @@ class EncoderLayer(nn.Module):
 
 
 class Encoder(nn.Module):
+    grad_checkpoint = False  # recompute each layer in backward: ~1/6 the activation memory, ~1.3x the time
+
     def __init__(self, num_layers, **layer_kwargs):
         super().__init__()
         self.layers = nn.ModuleList(EncoderLayer(**layer_kwargs) for _ in range(num_layers))
@@ -666,10 +669,12 @@ class Encoder(nn.Module):
         reference_points = self.reference_points(spatial_shapes_list, valid_ratios, vision.device)
         text_pos = sine_embedding(text_position_ids[..., None], num_pos_feats=text.shape[-1]).to(text.dtype)
         for layer in self.layers:
-            vision, text = layer(
-                vision, vision_pos, reference_points, vision_valid, spatial_shapes, spatial_shapes_list,
-                text, text_pos, text_token_mask, text_self_attn_mask,
-            )
+            args = (vision, vision_pos, reference_points, vision_valid, spatial_shapes, spatial_shapes_list,
+                    text, text_pos, text_token_mask, text_self_attn_mask)
+            if self.grad_checkpoint and torch.is_grad_enabled():
+                vision, text = torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
+            else:
+                vision, text = layer(*args)
         return vision, text
 
 

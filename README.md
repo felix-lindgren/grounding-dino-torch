@@ -116,6 +116,50 @@ The standalone steps are `python -m GDINOtorch.torch_version.export` and
 network strongly typed, so precision is set at export: `export --fp16` traces
 under fp16 autocast, and the engine keeps the ONNX's types.
 
+## Few-shot adaptation
+
+`FewShotGDINO` adapts a detector to your classes from a handful of boxed
+images, following [Singh et al.](https://arxiv.org/abs/2504.07252). The model
+is frozen; BERT is replaced by a learned `(classes * tokens + 2, 768)` table in
+BERT's output space, trained with the usual Hungarian focal/L1/GIoU loss. It
+works with every variant below, MM-Grounding-DINO tiny/base/large included.
+
+```python
+from GDINOtorch import GroundingDINO
+from GDINOtorch.few_shot import FewShotGDINO  # uv sync --extra fewshot
+
+model = GroundingDINO("openmmlab-community/mm_grounding_dino_base_all").eval().cuda()
+adapter = FewShotGDINO(model, ["chimney", "dam"])  # names only label the classes
+
+# Every instance of every class in the image must be boxed (xyxy pixels);
+# anything left unboxed is trained as background. labels index the class list.
+adapter.add_example("a.jpg", boxes=[[x1, y1, x2, y2], [x1, y1, x2, y2]], labels=[0, 1])
+adapter.add_example("b.jpg", boxes=[])  # an image with none of them
+
+adapter.fit()                                          # 400 steps, batch 4
+boxes, scores, labels = adapter.detect("test.jpg")     # threshold=0.3
+adapter.save("adapter.pt")                             # FewShotGDINO.load("adapter.pt", model)
+```
+
+`fit` takes ~0.2-0.3 s per training image on an RTX 3060 for tiny/base, ~1.1 s for large. Training
+uses a fused Triton deformable-attention kernel (`msda_triton.py`, ~3x faster
+than `grid_sample`'s backward); inference is untouched. The large models add a
+stride-4 level, which makes the encoder's activations ~4x larger, so `fit`
+recomputes encoder layers in backward for them (`checkpoint=`), 3.8 GB instead
+of 9.8 GB. `tools/few_shot_adapt.py` runs the DIOR / COCO-format benchmark.
+
+DIOR, 8 instances per class (73 images), default settings, first 500 test
+images, MM-Grounding-DINO against its own text-prompt baseline:
+
+| model | zero-shot mAP / F1 | 8-shot mAP / F1 | `fit` time |
+|---|---|---|---|
+| tiny (`o365v1_goldg_grit_v3det`) | 0.029 / 0.114 | 0.091 / 0.209 | 333 s |
+| base (`base_all`) | 0.052 / 0.183 | 0.065 / 0.119 | 432 s |
+| large (`large_all`) | 0.061 / 0.204 | 0.168 / 0.368 | 1742 s |
+
+The defaults (`lr=1e-2`, `init_std=0.5`) are the paper's and were not tuned per
+model; base gains little in mAP and loses F1.
+
 ## Model variants
 
 `GroundingDINO(model_type)` takes `"tiny"`, `"base"`, or any Hub repo id of a
