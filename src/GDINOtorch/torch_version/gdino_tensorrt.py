@@ -7,12 +7,13 @@ backbone, fusion encoder, query selection and decoder as one TensorRT engine.
 BERT stays in PyTorch; encode a caption once with ``encode_text`` and reuse it.
 
 Missing artifacts are exported (``export.py``) and built (``build_engine.py``)
-into ``output_dir`` on construction. An engine has a fixed image size: smaller
-inputs are zero-padded bottom/right into it, which needs no output adjustment
-since boxes are normalized to each image's unpadded area; larger inputs, CPU
-inputs, and captions longer than the engine allows fall back to PyTorch. Build
-at the size your images resize to (e.g. 750x1333 for 16:9) to avoid padding,
-which slightly changes scores.
+into ``output_dir`` on construction. By default an engine has a fixed image
+size: smaller inputs are zero-padded bottom/right into it, which needs no output
+adjustment since boxes are normalized to each image's unpadded area; larger
+inputs, CPU inputs, and captions longer than the engine allows fall back to
+PyTorch. Build at the size your images resize to (e.g. 750x1333 for 16:9) to
+avoid padding, which slightly changes scores, or with ``dynamic_size=True``,
+which runs every image up to ``max_size`` at its own size.
 
 The runner executes on a private CUDA stream ordered against the caller's
 current stream, so no CPU sync happens until the caller reads results back.
@@ -82,6 +83,10 @@ if TRT_AVAILABLE:
             names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]
             self.input_names = [n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT]
             self.output_names = [n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT]
+            # Exported with dynamic_size: any image (h, w) inside the profile runs unpadded.
+            self.dynamic_size = "pixel_values" in self.input_names and any(
+                d < 0 for d in self.engine.get_tensor_shape("pixel_values")[2:]
+            )
 
         def _torch_dtype(self, name):
             trt_dtype = self.engine.get_tensor_dtype(name)
@@ -93,6 +98,10 @@ if TRT_AVAILABLE:
         def profile_max(self, name):
             """Largest shape the engine's (single) optimization profile accepts for ``name``."""
             return tuple(self.engine.get_tensor_profile_shape(name, 0)[2])
+
+        def profile_min(self, name):
+            """Smallest shape the engine's optimization profile accepts for ``name``."""
+            return tuple(self.engine.get_tensor_profile_shape(name, 0)[0])
 
         def __call__(self, **inputs) -> dict[str, torch.Tensor]:
             caller = torch.cuda.current_stream(self.device)
@@ -140,6 +149,8 @@ class GroundingDINOTRT(GroundingDINO):
         onnx_path: str | Path | None = None,
         output_dir: str | Path = ".",
         image_size: tuple[int, int] = (800, 1333),
+        dynamic_size: bool = False,
+        max_size: tuple[int, int] = (1333, 1333),
         build_missing: bool = True,
         min_batch: int = 1,
         opt_batch: int = 1,
@@ -152,20 +163,32 @@ class GroundingDINOTRT(GroundingDINO):
     ):
         """``image_size`` is the engine's fixed (h, w); ignored when loading an existing engine.
 
+        ``dynamic_size`` instead builds one engine for every image size from
+        256x256 up to ``max_size`` (tuned for ``image_size``), which runs each
+        image at its own size: nothing is padded, so scores match PyTorch's and
+        no compute goes to padding. Its context memory follows ``max_size``;
+        at (1333, 1333) build it with ``max_batch=1`` on GPUs of 16 GB or less.
+
         ``fp16`` exports an fp16 ONNX (TensorRT 11 takes precision from the
         graph), so fp16 and fp32 engines each have their own ONNX.
         """
         self.output_dir = Path(output_dir)
         self.image_size = tuple(image_size)
+        self.dynamic_size = dynamic_size
         precision = "fp16" if fp16 else ("tf32" if tf32 else "fp32")
-        artifact_stem = f"gdino_{_model_slug(model_type)}_{self.image_size[0]}x{self.image_size[1]}"
+        slug = _model_slug(model_type)
+        if dynamic_size:
+            engine_stem = f"gdino_{slug}_dyn{max_size[0]}x{max_size[1]}"
+            onnx_stem = f"gdino_{slug}_dyn"
+        else:
+            engine_stem = onnx_stem = f"gdino_{slug}_{self.image_size[0]}x{self.image_size[1]}"
         self.engine_path = (
             Path(engine_path) if engine_path is not None
-            else self.output_dir / f"{artifact_stem}_{precision}.engine"
+            else self.output_dir / f"{engine_stem}_{precision}.engine"
         )
         self.onnx_path = (
             Path(onnx_path) if onnx_path is not None
-            else self.output_dir / f"{artifact_stem}{'_fp16' if fp16 else ''}.onnx"
+            else self.output_dir / f"{onnx_stem}{'_fp16' if fp16 else ''}.onnx"
         )
         self.fp16 = fp16
         self.build_missing = build_missing
@@ -177,6 +200,7 @@ class GroundingDINOTRT(GroundingDINO):
             "opt_text_len": opt_text_len,
             "workspace_gb": workspace_gb,
             "tf32": tf32,
+            **({"opt_size": self.image_size, "max_size": tuple(max_size)} if dynamic_size else {}),
         }
         self.trt = None
         super().__init__(model_type=model_type)
@@ -195,7 +219,10 @@ class GroundingDINOTRT(GroundingDINO):
             if self.fp16 and not torch.cuda.is_available():
                 print("CUDA is not available; an fp16 ONNX needs it to export, so nothing was built.")
                 return
-            export_image_path(self, self.onnx_path, self.image_size, simplify=self.simplify, fp16=self.fp16)
+            export_image_path(
+                self, self.onnx_path, self.image_size, simplify=self.simplify, fp16=self.fp16,
+                dynamic_size=self.dynamic_size,
+            )
 
         if not TRT_AVAILABLE:
             print("TensorRT is not installed; ONNX was exported but engine build was skipped.")
@@ -259,10 +286,15 @@ class GroundingDINOTRT(GroundingDINO):
         max_text_len = runner.profile_max("text_features")[1]
         if pixel_mask is None:
             pixel_mask = torch.ones((B, height, width), dtype=torch.bool, device=pixel_values.device)
-        fitted = self._pad_to(pixel_values, pixel_mask.bool(), engine_size)
+        if runner.dynamic_size:
+            min_size = runner.profile_min("pixel_values")[2:]
+            fits = min_size[0] <= height <= engine_size[0] and min_size[1] <= width <= engine_size[1]
+            fitted = (pixel_values, pixel_mask.bool()) if fits else None
+        else:
+            fitted = self._pad_to(pixel_values, pixel_mask.bool(), engine_size)
         if fitted is None or text.features.shape[1] > max_text_len:
             warnings.warn(
-                f"Input ({height}x{width} image, {text.features.shape[1]} tokens) exceeds the TensorRT "
+                f"Input ({height}x{width} image, {text.features.shape[1]} tokens) is outside the TensorRT "
                 f"engine ({engine_size[0]}x{engine_size[1]}, {max_text_len} tokens); running in PyTorch."
             )
             return super().forward_object_detection_from_text(pixel_values, text, pixel_mask)

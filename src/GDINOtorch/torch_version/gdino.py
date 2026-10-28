@@ -280,7 +280,7 @@ class PatchMerging(nn.Module):
         height, width = hw
         B, _, C = x.shape
         x = x.view(B, height, width, C)
-        if height % 2 or width % 2:
+        if torch.jit.is_tracing() or height % 2 or width % 2:  # a traced graph pads whatever the size
             x = F.pad(x, (0, 0, 0, width % 2, 0, height % 2))
         x = torch.cat([x[:, 0::2, 0::2], x[:, 1::2, 0::2], x[:, 0::2, 1::2], x[:, 1::2, 1::2]], dim=-1)
         return self.reduction(self.norm(x.view(B, -1, 4 * C)))
@@ -298,8 +298,9 @@ class SwinStage(nn.Module):
 
     def forward(self, x, hw):
         ws = self.window_size
-        padded_h = math.ceil(hw[0] / ws) * ws
-        padded_w = math.ceil(hw[1] / ws) * ws
+        # Integer ops only, so a traced graph keeps them dynamic in the image size.
+        padded_h = (hw[0] + ws - 1) // ws * ws
+        padded_w = (hw[1] + ws - 1) // ws * ws
         # Every shifted block in a stage sees the same padded grid.
         shift_mask = shifted_window_mask(padded_h, padded_w, ws, ws // 2, x.device)
         for block in self.blocks:
@@ -656,9 +657,10 @@ class Encoder(nn.Module):
         """Pixel centres of every level, normalized to the valid (unpadded) area."""
         points = []
         for level, (height, width) in enumerate(spatial_shapes_list):
+            # arange, not linspace: the same values, and it traces with a dynamic size.
             ref_y, ref_x = torch.meshgrid(
-                torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device),
-                torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device),
+                torch.arange(height, dtype=torch.float32, device=device) + 0.5,
+                torch.arange(width, dtype=torch.float32, device=device) + 0.5,
                 indexing="ij",
             )
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, level, 1] * height)
@@ -1079,7 +1081,10 @@ class GroundingDINO(nn.Module):
             ],
             1,
         )
-        spatial_shapes = torch.as_tensor(spatial_shapes_list, dtype=torch.long, device=vision.device)
+        if torch.jit.is_tracing():  # the level sizes are traced tensors; keep them dynamic
+            spatial_shapes = torch.stack([torch.stack(hw) for hw in spatial_shapes_list]).to(vision.device)
+        else:
+            spatial_shapes = torch.as_tensor(spatial_shapes_list, dtype=torch.long, device=vision.device)
         valid_ratios = torch.stack([self._valid_ratio(m) for m in masks], 1)
 
         # The fusion layers' attention runs ~3x faster unmasked, so drop the
@@ -1129,8 +1134,8 @@ class GroundingDINO(nn.Module):
             valid_h = valid[:, :, 0].sum(1)
             valid_w = valid[:, 0, :].sum(1)
             grid_y, grid_x = torch.meshgrid(
-                torch.linspace(0, height - 1, height, dtype=torch.float32, device=vision.device),
-                torch.linspace(0, width - 1, width, dtype=torch.float32, device=vision.device),
+                torch.arange(height, dtype=torch.float32, device=vision.device),
+                torch.arange(width, dtype=torch.float32, device=vision.device),
                 indexing="ij",
             )
             grid = torch.stack([grid_x, grid_y], -1)

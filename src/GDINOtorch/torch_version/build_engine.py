@@ -22,6 +22,12 @@ DEFAULT_MAX_BATCH = 2
 DEFAULT_OPT_TEXT_LEN = 32
 DEFAULT_MAX_TEXT_LEN = 256
 DEFAULT_WORKSPACE_GB = 8
+# Image (h, w) range of a dynamic-size engine: any orientation of the default
+# resize (short side 800, long side at most 1333), tuned for 4:3 landscape.
+# Below ~210x210 an image has fewer than the 900 proposals query selection keeps.
+DEFAULT_MIN_SIZE = (256, 256)
+DEFAULT_OPT_SIZE = (800, 1066)
+DEFAULT_MAX_SIZE = (1333, 1333)
 
 
 def build_engine(
@@ -34,8 +40,15 @@ def build_engine(
     max_text_len: int = DEFAULT_MAX_TEXT_LEN,
     workspace_gb: int = DEFAULT_WORKSPACE_GB,
     tf32: bool = True,
+    min_size: tuple[int, int] = DEFAULT_MIN_SIZE,
+    opt_size: tuple[int, int] = DEFAULT_OPT_SIZE,
+    max_size: tuple[int, int] = DEFAULT_MAX_SIZE,
 ):
     """Build and save the engine; returns its path, or None on failure.
+
+    ``min_size`` / ``opt_size`` / ``max_size`` (h, w) bound the image size of
+    an ONNX exported with ``dynamic_size``; a fixed-size ONNX ignores them.
+    Context memory grows with ``max_size``, and kernels are chosen for ``opt_size``.
 
     ``tf32`` (TensorRT's default) speeds up the layers the ONNX keeps in fp32 at
     a small accuracy cost: an fp32 engine drifts ~0.004 in score with it, ~0.002 without.
@@ -68,8 +81,9 @@ def build_engine(
     }
     profile = builder.create_optimization_profile()
     batches = (min_batch, opt_batch, max_batch)
-    profile.set_shape("pixel_values", *[(b, channels, height, width) for b in batches])
-    profile.set_shape("pixel_mask", *[(b, height, width) for b in batches])
+    sizes = [min_size, opt_size, max_size] if height < 0 or width < 0 else [(height, width)] * 3
+    profile.set_shape("pixel_values", *[(b, channels, *hw) for b, hw in zip(batches, sizes)])
+    profile.set_shape("pixel_mask", *[(b, *hw) for b, hw in zip(batches, sizes)])
     for name, shape in text_shapes.items():
         profile.set_shape(name, shape(min_batch, 1), shape(opt_batch, opt_text_len), shape(max_batch, max_text_len))
     config.add_optimization_profile(profile)
@@ -94,6 +108,9 @@ def _parse_args():
     p.add_argument("--max-text-len", type=int, default=DEFAULT_MAX_TEXT_LEN)
     p.add_argument("--workspace-gb", type=int, default=DEFAULT_WORKSPACE_GB)
     p.add_argument("--no-tf32", action="store_true")
+    p.add_argument("--min-size", type=int, nargs=2, default=DEFAULT_MIN_SIZE, metavar=("H", "W"))
+    p.add_argument("--opt-size", type=int, nargs=2, default=DEFAULT_OPT_SIZE, metavar=("H", "W"))
+    p.add_argument("--max-size", type=int, nargs=2, default=DEFAULT_MAX_SIZE, metavar=("H", "W"))
     return p.parse_args()
 
 
@@ -109,6 +126,9 @@ if __name__ == "__main__":
         max_text_len=args.max_text_len,
         workspace_gb=args.workspace_gb,
         tf32=not args.no_tf32,
+        min_size=tuple(args.min_size),
+        opt_size=tuple(args.opt_size),
+        max_size=tuple(args.max_size),
     )
     if engine:
         print(f"TensorRT engine has been created and saved to {args.engine}")

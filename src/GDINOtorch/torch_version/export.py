@@ -5,9 +5,11 @@ encoder, two-stage query selection, decoder and heads, taking a caption already
 encoded by :meth:`GroundingDINO.encode_text` as input. BERT stays in PyTorch:
 it runs once per caption, and its phrase masks use ``cummax``, which ONNX lacks.
 
-The image size is fixed at export (Swin's padding and shifted-window masks are
-traced as constants); batch size and caption length are dynamic axes, so one
-engine serves any vocabulary. Deformable attention is exported as TensorRT's
+Batch size and caption length are dynamic axes, so one engine serves any
+vocabulary. The image size is fixed at export unless ``dynamic_size``: then
+height and width are dynamic too (Swin's window padding, shifted-window masks
+and the level sizes are computed in the graph), and one engine runs every
+image at its own size. Deformable attention is exported as TensorRT's
 fused ``MultiscaleDeformableAttnPlugin_TRT`` instead of four ``GridSample`` per
 layer, about 10x faster in the engine; the ONNX therefore only runs under
 TensorRT, not onnxruntime.
@@ -21,6 +23,7 @@ convolutions, fp32 normalization, softmax and position embeddings).
 
 import argparse
 import contextlib
+import types
 import warnings
 from pathlib import Path
 
@@ -66,11 +69,15 @@ def _plugin_deformable_attention(value, spatial_shapes_list, sampling_locations,
     # sampling locations come out fp32 while value is fp16.
     sampling_locations = sampling_locations.to(value.dtype)
     attention_weights = attention_weights.to(value.dtype)
-    sizes = [h * w for h, w in spatial_shapes_list]
-    spatial_shapes = torch.tensor(spatial_shapes_list, dtype=torch.int32, device=value.device)
-    level_start_index = torch.tensor(
-        [sum(sizes[:i]) for i in range(len(sizes))], dtype=torch.int32, device=value.device
+    # Built with tensor ops from the (traced) level sizes, so a graph exported
+    # with a dynamic image size computes them per input.
+    spatial_shapes = torch.stack(
+        [torch.stack([torch.as_tensor(h), torch.as_tensor(w)]) for h, w in spatial_shapes_list]
     )
+    sizes = spatial_shapes.prod(-1)
+    level_start_index = torch.cat([sizes.new_zeros(1), sizes.cumsum(0)[:-1]])
+    spatial_shapes = spatial_shapes.to(value.device, torch.int32)
+    level_start_index = level_start_index.to(value.device, torch.int32)
     out = _DeformableAttentionPlugin.apply(
         value, spatial_shapes, level_start_index, sampling_locations, attention_weights
     )
@@ -84,6 +91,32 @@ def _deformable_attention_as_plugin():
         yield
     finally:
         gdino.multi_scale_deformable_attention = _torch_deformable_attention
+
+
+def _group_norm_from_reductions(self, x):
+    """``nn.GroupNorm`` from plain reductions, in fp32 as autocast runs it.
+
+    The exporter lowers GroupNorm to InstanceNormalization, which TensorRT 11
+    gets wrong on the small (stride 32/64) feature maps of a dynamic-size engine:
+    hundreds of output rows come back as garbage. ReduceMean is exact.
+    """
+    groups = x.float().reshape(x.shape[0], self.num_groups, -1)
+    mean = groups.mean(-1, keepdim=True)
+    var = (groups - mean).pow(2).mean(-1, keepdim=True)
+    groups = (groups - mean) * torch.rsqrt(var + self.eps)
+    return groups.reshape(x.shape) * self.weight[:, None, None] + self.bias[:, None, None]
+
+
+@contextlib.contextmanager
+def _group_norm_as_reductions(model: nn.Module):
+    norms = [m for m in model.modules() if isinstance(m, nn.GroupNorm)]
+    for m in norms:
+        m.forward = types.MethodType(_group_norm_from_reductions, m)
+    try:
+        yield
+    finally:
+        for m in norms:
+            del m.forward
 
 
 class ImagePath(nn.Module):
@@ -109,8 +142,13 @@ def export_image_path(
     device: str | torch.device | None = None,
     simplify: bool = False,
     fp16: bool = False,
+    dynamic_size: bool = False,
 ):
     """Trace ``model``'s image path at ``image_size`` (h, w) and write it to ``onnx_path``.
+
+    ``dynamic_size`` makes the image height and width dynamic axes, so one
+    engine takes any size within its profile and nothing is padded;
+    otherwise the graph is fixed at ``image_size``.
 
     Tracing runs on ``device`` (CUDA when available), keeping the trace's
     activations off host RAM; the model is moved back afterwards. ``fp16``
@@ -135,7 +173,8 @@ def export_image_path(
             text = model.encode_text(input_ids.to(device), attention_mask.to(device))
             pixel_values = torch.randn(1, 3, height, width, device=device)
             pixel_mask = torch.ones(1, height, width, dtype=torch.bool, device=device)
-            with _deformable_attention_as_plugin(), torch.autocast("cuda", torch.float16, enabled=fp16):
+            with _deformable_attention_as_plugin(), _group_norm_as_reductions(model), \
+                    torch.autocast("cuda", torch.float16, enabled=fp16):
                 torch.onnx.export(
                     ImagePath(model),
                     (pixel_values, pixel_mask, *text),
@@ -146,8 +185,8 @@ def export_image_path(
                     input_names=INPUT_NAMES,
                     output_names=OUTPUT_NAMES,
                     dynamic_axes={
-                        "pixel_values": {0: "batch"},
-                        "pixel_mask": {0: "batch"},
+                        "pixel_values": {0: "batch", **({2: "height", 3: "width"} if dynamic_size else {})},
+                        "pixel_mask": {0: "batch", **({1: "height", 2: "width"} if dynamic_size else {})},
                         "text_features": {0: "batch", 1: "text_len"},
                         "text_token_mask": {0: "batch", 1: "text_len"},
                         "text_self_attn_mask": {0: "batch", 1: "text_len", 2: "text_len"},
@@ -185,12 +224,14 @@ def _parse_args():
     p.add_argument("--image-size", type=int, nargs=2, default=(800, 1333), metavar=("H", "W"))
     p.add_argument("--simplify", action="store_true")
     p.add_argument("--fp16", action="store_true", help="export for an fp16 engine (needs CUDA)")
+    p.add_argument("--dynamic-size", action="store_true", help="dynamic image height and width")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     export_image_path(
-        GroundingDINO(args.model_type), args.onnx, tuple(args.image_size), simplify=args.simplify, fp16=args.fp16
+        GroundingDINO(args.model_type), args.onnx, tuple(args.image_size), simplify=args.simplify, fp16=args.fp16,
+        dynamic_size=args.dynamic_size,
     )
     print(f"Exported {args.onnx}")
