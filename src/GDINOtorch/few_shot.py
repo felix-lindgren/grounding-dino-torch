@@ -17,6 +17,7 @@ embeddings receive gradients.
 
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from scipy.optimize import linear_sum_assignment
 from torchvision.ops import batched_nms, generalized_box_iou, sigmoid_focal_loss
 from torchvision.ops.boxes import box_convert
 
-from .torch_version.gdino import GroundingDINO, TextFeatures, phrase_masks_and_positions
+from .torch_version.gdino import GroundingDINO, TextFeatures, phrase_masks_and_positions, resize_shape
 from .utils.tokenizer import build_caption
 
 
@@ -191,6 +192,14 @@ def _load(image):
     return image.convert("RGB")
 
 
+def _image_size(image):
+    """``(width, height)``, without decoding a path's pixels."""
+    if isinstance(image, (str, Path)):
+        with Image.open(image) as im:
+            return im.size
+    return image.size
+
+
 class FewShotGDINO:
     """Few-shot detector: Grounding DINO / MM-Grounding-DINO with learned class prompts.
 
@@ -235,41 +244,62 @@ class FewShotGDINO:
         self.examples.append((image if isinstance(image, (str, Path)) else _load(image), boxes, labels))
         return self
 
-    def fit(self, iters: int = 400, batch_size: int = 4, micro_batch: int = 1, lr: float = 1e-2,
-            weight_decay: float = 0.0, progress: bool = True, checkpoint: bool | None = None):
+    def fit(self, iters: int = 400, batch_size: int = 4, micro_batch: int | None = None, lr: float = 1e-2,
+            weight_decay: float = 0.0, progress: bool = True, checkpoint: bool | None = None,
+            compile: bool | str = False):
         """Train the class embeddings on the added examples; returns the final loss.
 
-        ``checkpoint`` recomputes encoder layers in backward to save memory. The
-        default turns it on for 5-level (large) models, whose stride-4 map makes
-        the encoder's activations ~4x bigger (9.8 GB vs ~3 GB at 800x1200).
+        Each forward runs ``micro_batch`` images, with gradients accumulated to
+        ``batch_size``. One image per forward leaves a fast GPU waiting on
+        kernel launches (tiny on an RTX 5070 Ti: 119 s for 400 steps, 76 s at
+        four). ``checkpoint`` recomputes encoder layers in backward, ~20% more
+        time for a fraction of the memory; the large models' stride-4 level
+        makes their encoder's activations ~4x bigger. By default (``None``)
+        one training step at the largest padded size measures the memory per
+        image: checkpointing turns on only if a micro-batch would not fit
+        without it, and ``micro_batch`` becomes the largest divisor of
+        ``batch_size`` that fits.
+
+        ``compile=True``, or a ``torch.compile`` mode such as
+        ``"reduce-overhead"``, compiles the detection forward and backward:
+        15-20% less per step after a compile of 1-2 minutes (cached on disk
+        for later runs), so it pays off on longer runs. Every micro-batch is
+        then padded to one size, the examples' largest height and width, and
+        random crops are resized back to their image's size, so the graph
+        compiles once.
         """
         if not self.examples:
             raise ValueError("add_example() before fit()")
         device = self.embeds.embeddings.device
-        if checkpoint is None:
-            checkpoint = self.model.level_embed.shape[0] >= 5
+        sizes = [resize_shape(h, w, self.image_size) for w, h in (_image_size(e[0]) for e in self.examples)]
+        canvas = (max(h for h, _ in sizes), max(w for _, w in sizes))  # the most a padded batch can reach
+        micro_batch, checkpoint = self._plan(batch_size, micro_batch, checkpoint, canvas)
         self.model.encoder.grad_checkpoint = checkpoint
+        forward = self.model.forward_object_detection_from_text
+        if compile:
+            forward = torch.compile(forward, mode=None if compile is True else compile, dynamic=False)
+        else:
+            canvas = None
         rng = random.Random(self.seed)
         opt = torch.optim.AdamW([self.embeds.embeddings], lr=lr, weight_decay=weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
-        projection = self.model.text_projection
         bar = range(iters)
         if progress:
             from tqdm import tqdm
-            bar = tqdm(bar, desc="fit")
+            bar = tqdm(bar, desc=f"fit (micro-batch {micro_batch}{', checkpoint' if checkpoint else ''})")
         for step in bar:
             opt.zero_grad(set_to_none=True)
             for _ in range(0, batch_size, micro_batch):
                 images, targets = [], []
                 for src, boxes, labels in (rng.choice(self.examples) for _ in range(micro_batch)):
-                    img, boxes, labels = augment(_load(src), boxes, labels, rng)
+                    image = _load(src)
+                    img, boxes, labels = augment(image, boxes, labels, rng)
+                    if canvas is not None and img.size != image.size:
+                        sx, sy = image.size[0] / img.size[0], image.size[1] / img.size[1]
+                        img, boxes = img.resize(image.size, Image.BILINEAR), boxes * [sx, sy, sx, sy]
                     images.append(img)
                     targets.append(to_target(img, boxes, labels, device))
-                pixel_values, pixel_mask = self.model.preprocess_image(images, size=self.image_size)
-                with torch.autocast(device.type, dtype=torch.bfloat16):
-                    text = self.embeds.text_features(projection, len(images))
-                    logits, pred = self.model.forward_object_detection_from_text(pixel_values, text, pixel_mask)
-                loss, parts = detection_loss(self.embeds, logits, pred, targets)
+                loss, parts = self._loss(forward, images, targets, canvas)
                 (loss * micro_batch / batch_size).backward()
             opt.step()
             sched.step()
@@ -277,6 +307,58 @@ class FewShotGDINO:
                 bar.set_postfix(loss=f"{loss.item():.3f}", **{k: f"{v:.2f}" for k, v in parts.items()})
         self.model.encoder.grad_checkpoint = False
         return loss.item()
+
+    def _loss(self, forward, images, targets, canvas=None):
+        """Detection loss of one micro-batch, ``canvas`` ``(h, w)`` padding it to a fixed size."""
+        pixel_values, pixel_mask = self.model.preprocess_image(images, size=self.image_size)
+        if canvas is not None:
+            pad = (0, canvas[1] - pixel_values.shape[-1], 0, canvas[0] - pixel_values.shape[-2])
+            pixel_values, pixel_mask = F.pad(pixel_values, pad), F.pad(pixel_mask, pad)
+        with torch.autocast(pixel_values.device.type, dtype=torch.bfloat16):
+            text = self.embeds.text_features(self.model.text_projection, len(images))
+            logits, pred = forward(pixel_values, text, pixel_mask)
+        return detection_loss(self.embeds, logits, pred, targets)
+
+    def _plan(self, batch_size, micro_batch, checkpoint, canvas):
+        """Fill in ``micro_batch`` and ``checkpoint`` left as ``None`` from measured memory."""
+        device = self.embeds.embeddings.device
+        if device.type != "cuda":
+            return micro_batch or 1, self.model.level_embed.shape[0] >= 5 if checkpoint is None else checkpoint
+        if micro_batch is not None and checkpoint is not None:
+            return micro_batch, checkpoint
+        free, _ = torch.cuda.mem_get_info(device)
+        budget = 0.85 * (free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+        per_image = self._memory_per_image(bool(checkpoint), canvas)
+        if checkpoint is None:
+            checkpoint = (micro_batch or 1) * per_image > budget
+            if checkpoint:
+                per_image = self._memory_per_image(True, canvas)
+        if micro_batch is None:
+            fits = [d for d in range(1, batch_size + 1) if batch_size % d == 0 and d * per_image <= budget]
+            micro_batch = max(fits, default=1)
+        return micro_batch, checkpoint
+
+    def _memory_per_image(self, checkpoint, canvas):
+        """Peak bytes one training image adds, padded to ``canvas``; ``inf`` if it runs out."""
+        device = self.embeds.embeddings.device
+        src, boxes, labels = max(self.examples, key=lambda e: math.prod(
+            resize_shape(*_image_size(e[0])[::-1], self.image_size)))
+        image = _load(src)
+        self.model.encoder.grad_checkpoint = checkpoint
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        base = torch.cuda.memory_allocated(device)
+        try:
+            loss, _ = self._loss(self.model.forward_object_detection_from_text, [image],
+                                 [to_target(image, boxes, labels, device)], canvas)
+            loss.backward()
+            torch.cuda.synchronize(device)
+            return torch.cuda.max_memory_allocated(device) - base
+        except torch.OutOfMemoryError:
+            return math.inf
+        finally:
+            self.embeds.embeddings.grad = None
+            self.model.encoder.grad_checkpoint = False
 
     @torch.no_grad()
     def scores(self, pixel_values, pixel_mask=None):

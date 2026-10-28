@@ -455,7 +455,7 @@ def phrase_masks_and_positions(input_ids: torch.Tensor) -> tuple[torch.Tensor, t
 try:  # fused Triton kernels: ~10x faster than grid_sample forward, ~3x in backward
     from .msda_triton import multi_scale_deformable_attention_triton as _msda_triton
     from .msda_triton import multi_scale_deformable_attention_triton_forward as _msda_triton_forward
-except ImportError:
+except (ImportError, AttributeError):  # no Triton, or a torch without torch.library.custom_op (< 2.4)
     _msda_triton = _msda_triton_forward = None
 
 
@@ -571,6 +571,25 @@ class BiMultiHeadAttention(nn.Module):
 
         # Both directions share the similarity q k^T [B, heads, N_img, N_txt]:
         # softmax over text for the vision update, over pixels for the text one.
+        masked = vision_pad_mask is not None or text_pad_mask is not None
+        if masked and torch.is_grad_enabled() and (vision.requires_grad or text.requires_grad) \
+                and not torch.jit.is_tracing():
+            # Training with masks (padded batches, compiled graphs): masked SDPA
+            # leaves flash for the memory-efficient kernel, whose backward is
+            # slow here (12.9 ms fwd+bwd per layer for tiny at 800x800), while
+            # the similarity is small (N_txt is ~100) and cheap to materialize
+            # (1.4 ms). Unmasked, flash stays fastest.
+            attn = (q @ k.transpose(-1, -2)).clamp(-50000, 50000)  # fp16 has little range to spare
+            attn_t = attn.transpose(-1, -2)
+            if text_pad_mask is not None:
+                attn = attn.masked_fill(text_pad_mask[:, None, None, :], float("-inf"))
+            if vision_pad_mask is not None:
+                attn_t = attn_t.masked_fill(vision_pad_mask[:, None, None, :], float("-inf"))
+            # Softmax in q's dtype (bf16 under autocast, accumulated in fp32):
+            # the product casts it there anyway, and fp32 costs memory traffic.
+            vision_out = attn.softmax(-1, dtype=attn.dtype) @ v_text
+            text_out = attn_t.softmax(-1, dtype=attn.dtype) @ v_vision
+            return self.out_vision_proj(self._merge(vision_out)), self.out_text_proj(self._merge(text_out))
         # Fused attention computes it twice rather than materializing it.
         text_keep = None if text_pad_mask is None else ~text_pad_mask[:, None, None, :]
         vision_keep = None if vision_pad_mask is None else ~vision_pad_mask[:, None, None, :]
@@ -1089,9 +1108,10 @@ class GroundingDINO(nn.Module):
 
         # The fusion layers' attention runs ~3x faster unmasked, so drop the
         # masks when nothing is padded (images of one size, one caption). The
-        # check is a sync; a traced graph keeps them, for zero-padded inputs.
+        # check is a sync; a traced or compiled graph keeps them, for
+        # zero-padded inputs.
         vision_padded = text_padded = True
-        if not torch.jit.is_tracing():
+        if not (torch.jit.is_tracing() or torch.compiler.is_compiling()):
             vision_padded, text_padded = (~torch.stack([pixel_mask.all(), text.token_mask.all()])).tolist()
         vision, text_hidden = self.encoder(
             vision, vision_pos, vision_valid, spatial_shapes, spatial_shapes_list, valid_ratios,

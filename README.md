@@ -164,29 +164,44 @@ adapter = FewShotGDINO(model, ["chimney", "dam"])  # names only label the classe
 adapter.add_example("a.jpg", boxes=[[x1, y1, x2, y2], [x1, y1, x2, y2]], labels=[0, 1])
 adapter.add_example("b.jpg", boxes=[])  # an image with none of them
 
-adapter.fit()                                          # 400 steps, batch 4
+adapter.fit()                                          # 400 steps, batch 4; compile=True for long runs
 boxes, scores, labels = adapter.detect("test.jpg")     # threshold=0.3
 adapter.save("adapter.pt")                             # FewShotGDINO.load("adapter.pt", model)
 ```
 
-`fit` takes ~0.2-0.3 s per training image on an RTX 3060 for tiny/base, ~1.1 s for large. Training
-uses the backward of the fused Triton deformable-attention kernel
-(`msda_triton.py`, ~3x faster than `grid_sample`'s). The large models add a
-stride-4 level, which makes the encoder's activations ~4x larger, so `fit`
-recomputes encoder layers in backward for them (`checkpoint=`), 3.8 GB instead
-of 9.8 GB. `tools/few_shot_adapt.py` runs the DIOR / COCO-format benchmark.
+`fit` takes ~0.2 s per training image on an RTX 3060 for tiny/base (~0.05 s on
+an RTX 5070 Ti), ~0.75 s for large (~0.2 s). Training uses the backward of the
+fused Triton deformable-attention kernel (`msda_triton.py`, ~3x faster than
+`grid_sample`'s), registered as a `torch.library` op so `torch.compile` traces
+through it. One image per forward leaves a fast GPU waiting on kernel
+launches, so `fit` measures one training step and runs as many images per
+forward as fit in memory (`micro_batch=`). Recomputing encoder layers in
+backward (`checkpoint=`) costs ~20% more time and is only turned on when a
+single image would not fit without it: the large models' stride-4 level makes
+their encoder's activations ~4x larger, 7.0 GB peak at 800x800 without it.
+
+`fit(compile=True)` compiles the training step: tiny's 400 steps take 64 s
+instead of 76 s on the RTX 5070 Ti (225 s instead of 273 s on the 3060),
+large's 262 s instead of 317 s (1017 s instead of 1207 s), plus 1-2 minutes of
+compiling, cached on disk for later runs. It pads every batch to the examples'
+largest height and width so the graph compiles once. `tools/few_shot_adapt.py`
+runs the DIOR / COCO-format benchmark (`--compile` to compile).
 
 DIOR, 8 instances per class (73 images), default settings, first 500 test
 images, MM-Grounding-DINO against its own text-prompt baseline:
 
-| model | zero-shot mAP / F1 | 8-shot mAP / F1 | `fit` time |
+| model | zero-shot mAP / F1 | 8-shot mAP / F1 | `fit` time, RTX 3060 / 5070 Ti |
 |---|---|---|---|
-| tiny (`o365v1_goldg_grit_v3det`) | 0.029 / 0.114 | 0.091 / 0.209 | 333 s |
-| base (`base_all`) | 0.052 / 0.183 | 0.065 / 0.119 | 432 s |
-| large (`large_all`) | 0.061 / 0.204 | 0.168 / 0.368 | 1742 s |
+| tiny (`o365v1_goldg_grit_v3det`) | 0.029 / 0.114 | 0.076 / 0.208 | 273 / 76 s |
+| base (`base_all`) | 0.052 / 0.183 | 0.080 / 0.179 | 327 / 93 s |
+| large (`large_all`) | 0.061 / 0.204 | 0.152 / 0.356 | 1207 / 317 s |
 
-The defaults (`lr=1e-2`, `init_std=0.5`) are the paper's and were not tuned per
-model; base gains little in mAP and loses F1.
+8-shot accuracy is from the 3060 runs. The defaults (`lr=1e-2`,
+`init_std=0.5`) are the paper's and were not tuned per model; base gains
+little in mAP and nothing in F1. Training is not bit-reproducible (the Triton
+backward accumulates with atomics), and with 73 images the spread between runs
+at seed 0 is wide: 0.033 to 0.081 mAP over seven tiny runs, 0.152 to 0.172
+over six large ones.
 
 ## Model variants
 

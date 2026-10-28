@@ -92,22 +92,37 @@ _shape_cache: dict = {}
 
 
 def _level_tensors(spatial_shapes_list, device):
-    key = (tuple(map(tuple, spatial_shapes_list)), device)
-    if key not in _shape_cache:
+    """Level sizes ``[L * 2]`` and start offsets ``[L]`` as int32 on ``device``.
+
+    Cached in eager mode. Under ``torch.compile`` they are built in the graph
+    instead, as constants: a cached tensor first made inside a CUDA-graph
+    memory pool would be left there untracked.
+    """
+    def build():
         sizes = [h * w for h, w in spatial_shapes_list]
         starts = [sum(sizes[:i]) for i in range(len(sizes))]
-        _shape_cache[key] = (
+        return (
             torch.tensor([list(s) for s in spatial_shapes_list], dtype=torch.int32, device=device).flatten(),
             torch.tensor(starts, dtype=torch.int32, device=device),
         )
+
+    if torch.compiler.is_compiling():
+        return build()
+    key = (tuple(map(tuple, spatial_shapes_list)), device)
+    if key not in _shape_cache:
+        _shape_cache[key] = build()
     return _shape_cache[key]
 
 
-def _forward(value, spatial_shapes_list, loc, wt):
+# Registered as torch.library custom ops, so torch.compile traces through them
+# (an autograd.Function around Triton launches breaks the graph).
+@torch.library.custom_op("gdinotorch::msda", mutates_args=())
+def _msda(value: torch.Tensor, shapes: torch.Tensor, starts: torch.Tensor, loc: torch.Tensor,
+          wt: torch.Tensor) -> torch.Tensor:
+    """``[B, Q, H, D]`` in ``value``'s dtype; sampling and the weighted sum run in fp32."""
     B, S, H, D = value.shape
     _, Q, _, L, P, _ = loc.shape
     value, loc, wt = value.contiguous(), loc.contiguous(), wt.contiguous()
-    shapes, starts = _level_tensors(spatial_shapes_list, value.device)
     out = torch.empty(B, Q, H, D, device=value.device, dtype=value.dtype)
     N = B * Q * H
     with torch.cuda.device(value.device):  # Triton launches on the current device
@@ -116,37 +131,61 @@ def _forward(value, spatial_shapes_list, loc, wt):
     return out
 
 
-class _MSDA(torch.autograd.Function):
-    @staticmethod
-    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
-    def forward(ctx, value, spatial_shapes_list, loc, wt):
-        out = _forward(value, spatial_shapes_list, loc, wt)
-        ctx.save_for_backward(value.contiguous(), loc.contiguous(), wt.contiguous())
-        ctx.shapes = spatial_shapes_list
-        return out.flatten(2)
+@_msda.register_fake
+def _(value, shapes, starts, loc, wt):
+    B, _, H, D = value.shape
+    return value.new_empty(B, loc.shape[1], H, D)
 
-    @staticmethod
-    @torch.amp.custom_bwd(device_type="cuda")
-    def backward(ctx, gout):
-        value, loc, wt = ctx.saved_tensors
-        B, S, H, D = value.shape
-        _, Q, _, L, P, _ = loc.shape
-        shapes, starts = _level_tensors(ctx.shapes, value.device)
-        gvalue = torch.zeros(value.shape, device=value.device, dtype=torch.float32)
-        gloc, gwt = torch.empty_like(loc), torch.empty_like(wt)
-        N = B * Q * H
-        with torch.cuda.device(value.device):
-            _bwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, gout.contiguous(), gvalue, gloc,
-                                                  gwt, N, Q * H, S, H, L=L, P=P, D=D, BLOCK=BLOCK)
-        return gvalue.to(value.dtype), None, gloc, gwt
+
+@torch.library.custom_op("gdinotorch::msda_backward", mutates_args=())
+def _msda_backward(value: torch.Tensor, shapes: torch.Tensor, starts: torch.Tensor, loc: torch.Tensor,
+                   wt: torch.Tensor, gout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, S, H, D = value.shape
+    _, Q, _, L, P, _ = loc.shape
+    value, loc, wt = value.contiguous(), loc.contiguous(), wt.contiguous()
+    gvalue = torch.zeros(value.shape, device=value.device, dtype=torch.float32)
+    gloc, gwt = torch.empty_like(loc), torch.empty_like(wt)
+    N = B * Q * H
+    with torch.cuda.device(value.device):
+        _bwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, gout.contiguous(), gvalue, gloc,
+                                              gwt, N, Q * H, S, H, L=L, P=P, D=D, BLOCK=BLOCK)
+    return gvalue.to(value.dtype), gloc, gwt
+
+
+@_msda_backward.register_fake
+def _(value, shapes, starts, loc, wt, gout):
+    return torch.empty_like(value), torch.empty_like(loc), torch.empty_like(wt)
+
+
+def _setup_context(ctx, inputs, output):
+    value, shapes, starts, loc, wt = inputs
+    ctx.save_for_backward(value, shapes, starts, loc, wt)
+
+
+def _backward(ctx, gout):
+    value, shapes, starts, loc, wt = ctx.saved_tensors
+    gvalue, gloc, gwt = _msda_backward(value, shapes, starts, loc, wt, gout)
+    return gvalue, None, None, gloc, gwt
+
+
+_msda.register_autograd(_backward, setup_context=_setup_context)
 
 
 def multi_scale_deformable_attention_triton(value, spatial_shapes_list, sampling_locations, attention_weights):
-    """Drop-in for ``multi_scale_deformable_attention``; differentiable, CUDA only."""
-    return _MSDA.apply(value, spatial_shapes_list, sampling_locations, attention_weights)
+    """Drop-in for ``multi_scale_deformable_attention``; differentiable, CUDA only.
+
+    Under autocast the inputs are cast to fp32 (``custom_fwd(cast_inputs=torch.float32)``'s rule).
+    """
+    if torch.is_autocast_enabled("cuda"):
+        value, sampling_locations, attention_weights = (
+            value.float(), sampling_locations.float(), attention_weights.float()
+        )
+    shapes, starts = _level_tensors(spatial_shapes_list, value.device)
+    return _msda(value, shapes, starts, sampling_locations, attention_weights).flatten(2)
 
 
 def multi_scale_deformable_attention_triton_forward(value, spatial_shapes_list, sampling_locations, attention_weights):
     """Inference-only forward, no autograd. ``value`` keeps its dtype (fp16 under
     autocast) and the output takes it; sampling and the weighted sum run in fp32."""
-    return _forward(value, spatial_shapes_list, sampling_locations, attention_weights).flatten(2)
+    shapes, starts = _level_tensors(spatial_shapes_list, value.device)
+    return _msda(value, shapes, starts, sampling_locations, attention_weights).flatten(2)

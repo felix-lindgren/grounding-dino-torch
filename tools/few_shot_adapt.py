@@ -144,7 +144,10 @@ def main():
     p.add_argument("--init", default="random", choices=["random", "text"], help="text: start from the class names' BERT features")
     p.add_argument("--iters", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--micro-batch", type=int, default=1, help="images per forward; gradients accumulate to --batch-size")
+    p.add_argument("--micro-batch", type=int, help="images per forward; gradients accumulate to --batch-size "
+                   "(default: as many as fit in memory)")
+    p.add_argument("--compile", nargs="?", const=True, default=False,
+                   help="torch.compile the training step; optionally a mode, e.g. reduce-overhead")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--image-size", type=int, default=800)
@@ -180,7 +183,7 @@ def main():
         adapter.add_example(r.loader(), r.boxes, r.labels)
     embeds = adapter.embeds
     t0 = time.time()
-    adapter.fit(args.iters, args.batch_size, args.micro_batch, args.lr, args.weight_decay)
+    adapter.fit(args.iters, args.batch_size, args.micro_batch, args.lr, args.weight_decay, compile=args.compile)
     print(f"trained {embeds.embeddings.numel()} params in {time.time() - t0:.0f}s")
     evaluate(model, test_records, names, args, device, embeds, title=f"{args.dataset} {args.shots}-shot")
     if args.out:
