@@ -70,9 +70,18 @@ with torch.inference_mode():
 ### Precision
 
 `torch.autocast("cuda", dtype=torch.float16)` and `model.half()` both work, and
-match fp32 closely (top detections within ~0.002 in score). On an RTX 3060, tiny
-at 800x1066 runs in about 165 ms/image under autocast, on par with the
-`transformers` implementation.
+match fp32 closely (top detections within ~0.002 in score). Under autocast, a
+COCO image takes about 91 ms (tiny) / 139 ms (base) from PIL image to
+detections on an RTX 3060, and 32 / 43 ms on an RTX 5070 Ti.
+
+When every detection call runs under fp16 autocast, `model.precast_weights()`
+stores the image path's Linear and Conv2d weights in fp16 instead of having
+autocast cast them on every call: outputs are bit-identical and each image
+~2.4 ms faster on an RTX 5070 Ti. Outside autocast those layers then raise on
+fp32 inputs; BERT keeps fp32 weights, so `encode_text` works either way.
+
+[`docs/inference-speed.md`](docs/inference-speed.md) has the COCO accuracy and
+latency measurements behind these numbers, and the tools to reproduce them.
 
 ### TensorRT
 
@@ -99,13 +108,32 @@ set `image_size` to the size your images resize to, e.g. `(750, 1333)` for
 16:9. Deformable attention runs as TensorRT's fused
 `MultiscaleDeformableAttnPlugin_TRT`.
 
-On an RTX 3060, batch 1 at 800x1333, compared with fp16 autocast:
+For images of mixed shapes, `dynamic_size=True` builds one engine for every
+size from 256x256 up to `max_size` (default `(1333, 1333)`, so portrait images
+fit too), with kernels tuned for `image_size`. Every image runs at its own
+size, unpadded, so scores match PyTorch's. It is ~8% slower than an engine
+fixed at exactly the image's size. At the default `max_size`, build it with
+`max_batch=1` on GPUs with 16 GB or less:
 
-| model | autocast | TensorRT fp16 |
+```python
+model = GroundingDINOTRT(
+    "tiny", output_dir="trt_engines", dynamic_size=True, image_size=(800, 1066), max_batch=1
+).eval().cuda()  # gdino_tiny_dyn1333x1333_fp16.engine
+```
+
+On an RTX 5070 Ti, batch 1, PIL image to detections, mean over four COCO
+images (two landscape, two portrait):
+
+| model | autocast | TensorRT fp16, `dynamic_size=True` |
 |---|---|---|
-| tiny | 197 ms | 61 ms |
-| base | 286 ms | 83 ms |
-| `mm_grounding_dino_large_all` | ~920 ms | 233 ms |
+| tiny | 32 ms | 27 ms |
+| base | 43 ms | 36 ms |
+
+PyTorch is launch-bound at batch 1, so TensorRT's lead grows at smaller sizes
+(tiny at a 640 short side: 32 against 18 ms). On an RTX 3060 at 800x1333, tiny's
+forward takes 107 ms under autocast against 98 ms in a fixed-size engine;
+`mm_grounding_dino_large_all`'s takes 432 ms under autocast (TensorRT not
+re-measured).
 
 Top detections stay within ~0.01 in score of fp32 for tiny and base; on the one
 image checked, large's top detection moved by 0.02 (autocast: 0.002), so check
@@ -142,8 +170,8 @@ adapter.save("adapter.pt")                             # FewShotGDINO.load("adap
 ```
 
 `fit` takes ~0.2-0.3 s per training image on an RTX 3060 for tiny/base, ~1.1 s for large. Training
-uses a fused Triton deformable-attention kernel (`msda_triton.py`, ~3x faster
-than `grid_sample`'s backward); inference is untouched. The large models add a
+uses the backward of the fused Triton deformable-attention kernel
+(`msda_triton.py`, ~3x faster than `grid_sample`'s). The large models add a
 stride-4 level, which makes the encoder's activations ~4x larger, so `fit`
 recomputes encoder layers in backward for them (`checkpoint=`), 3.8 GB instead
 of 9.8 GB. `tools/few_shot_adapt.py` runs the DIOR / COCO-format benchmark.
@@ -224,7 +252,14 @@ src/GDINOtorch/
     gdino_tensorrt.py  # GroundingDINOTRT: the image path as a TensorRT engine
     export.py       # image path -> ONNX (fused deformable-attention plugin)
     build_engine.py # ONNX -> TensorRT engine
+    msda_triton.py  # fused Triton deformable attention (forward and backward)
   utils/
     tokenizer.py    # BERT tokenization, caption building, phrase->token spans
     hf_hub_utils.py # cache-first weight lookup
+tools/
+  ovd_eval.py       # zero-shot COCO / Fashionpedia / DIOR mAP
+  bench.py          # batch-1 latency and per-stage breakdown
+  few_shot_adapt.py # few-shot adaptation benchmark
+docs/
+  inference-speed.md
 ```
