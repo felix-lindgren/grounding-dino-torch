@@ -147,6 +147,10 @@ class MultiheadAttention(nn.Module):
         q = self._heads(self.query(queries))
         k = self._heads(self.key(keys))
         v = self._heads(self.value(values))
+        if attn_mask is not None and attn_mask.is_floating_point():
+            # SDPA's fused kernels need an additive mask in q's dtype (fp16
+            # under autocast); any other falls back to the unfused math path.
+            attn_mask = attn_mask.to(q.dtype)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(batch_size, query_len, -1)
         return self.out_proj(out)
@@ -224,11 +228,12 @@ class WindowAttention(MultiheadAttention):
     def forward(self, windows, shift_mask=None):
         n = self.window_area
         bias = self.relative_position_bias_table[self.relative_position_index]
-        mask = bias.view(n, n, -1).permute(2, 0, 1).unsqueeze(0)  # [1, heads, n, n]
+        # Contiguous: SDPA's fused kernels need a unit-stride mask, and fall back to math otherwise.
+        mask = bias.view(n, n, -1).permute(2, 0, 1).contiguous().unsqueeze(0)  # [1, heads, n, n]
         if shift_mask is not None:
             num_windows = shift_mask.shape[0]
             mask = (mask + shift_mask.unsqueeze(1)).repeat(windows.shape[0] // num_windows, 1, 1, 1)
-        return super().forward(windows, windows, windows, attn_mask=mask.to(windows.dtype))
+        return super().forward(windows, windows, windows, attn_mask=mask)
 
 
 class SwinBlock(nn.Module):
@@ -446,23 +451,30 @@ def phrase_masks_and_positions(input_ids: torch.Tensor) -> tuple[torch.Tensor, t
 # ---------------------------------------------------------------------------
 
 
-try:  # fused fwd+bwd kernel; only taken when gradients are needed (training), inference is unchanged
+try:  # fused Triton kernels: ~10x faster than grid_sample forward, ~3x in backward
     from .msda_triton import multi_scale_deformable_attention_triton as _msda_triton
+    from .msda_triton import multi_scale_deformable_attention_triton_forward as _msda_triton_forward
 except ImportError:
-    _msda_triton = None
+    _msda_triton = _msda_triton_forward = None
 
 
 def multi_scale_deformable_attention(value, spatial_shapes_list, sampling_locations, attention_weights):
-    """Pure-PyTorch MSDeformAttn: bilinear-sample each level, then weight and sum.
+    """MSDeformAttn: bilinear-sample each level, then weight and sum.
 
     value: [B, S, heads, head_dim]; sampling_locations: [B, Q, heads, levels,
     points, 2] in [0, 1]; attention_weights: [B, Q, heads, levels, points].
     Returns [B, Q, heads * head_dim].
+
+    On CUDA this is one Triton kernel that samples at fp32 locations; the
+    pure-PyTorch path below (CPU) rounds them to ``value``'s dtype, a few
+    hundredths of a pixel at fp16.
     """
-    if _msda_triton is not None and value.is_cuda and torch.is_grad_enabled() and (
-        value.requires_grad or sampling_locations.requires_grad or attention_weights.requires_grad
-    ):
-        return _msda_triton(value, spatial_shapes_list, sampling_locations, attention_weights)
+    if _msda_triton is not None and value.is_cuda and not torch.jit.is_tracing():
+        if torch.is_grad_enabled() and (
+            value.requires_grad or sampling_locations.requires_grad or attention_weights.requires_grad
+        ):
+            return _msda_triton(value, spatial_shapes_list, sampling_locations, attention_weights)
+        return _msda_triton_forward(value, spatial_shapes_list, sampling_locations, attention_weights)
     batch_size, _, num_heads, head_dim = value.shape
     _, num_queries, _, num_levels, num_points, _ = sampling_locations.shape
     value_list = value.split([h * w for h, w in spatial_shapes_list], dim=1)
@@ -543,36 +555,27 @@ class BiMultiHeadAttention(nn.Module):
 
     def _heads(self, x):
         B, L, _ = x.shape
-        return x.view(B, L, self.num_heads, self.head_dim).transpose(1, 2).reshape(B * self.num_heads, L, self.head_dim)
+        return x.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-    def _merge(self, x, batch_size):
-        _, L, _ = x.shape
-        return x.view(batch_size, self.num_heads, L, self.head_dim).transpose(1, 2).reshape(batch_size, L, self.embed_dim)
+    def _merge(self, x):
+        B, _, L, _ = x.shape
+        return x.transpose(1, 2).reshape(B, L, self.embed_dim)
 
     def forward(self, vision, text, vision_pad_mask=None, text_pad_mask=None):
         """Pad masks are True where the vision pixel / text token is padding."""
-        B = vision.shape[0]
         q = self._heads(self.vision_proj(vision) * self.scale)
         k = self._heads(self.text_proj(text))
         v_vision = self._heads(self.values_vision_proj(vision))
         v_text = self._heads(self.values_text_proj(text))
 
-        attn = torch.bmm(q, k.transpose(1, 2))  # [B*heads, N_img, N_txt]
-        # Shift and clamp before softmax: fp16 has little range to spare.
-        attn = (attn - attn.max()).clamp(min=-50000, max=50000)
-        attn_t = attn.transpose(1, 2)
-        attn_t = (attn_t - attn_t.max(dim=-1, keepdim=True)[0]).clamp(min=-50000, max=50000)
-
-        if vision_pad_mask is not None:
-            mask = vision_pad_mask[:, None, None, :].expand(-1, self.num_heads, -1, -1).flatten(0, 1)
-            attn_t = attn_t.masked_fill(mask, float("-inf"))
-        if text_pad_mask is not None:
-            mask = text_pad_mask[:, None, None, :].expand(-1, self.num_heads, -1, -1).flatten(0, 1)
-            attn = attn.masked_fill(mask, float("-inf"))
-
-        vision_out = torch.bmm(attn.softmax(dim=-1), v_text)
-        text_out = torch.bmm(attn_t.softmax(dim=-1), v_vision)
-        return self.out_vision_proj(self._merge(vision_out, B)), self.out_text_proj(self._merge(text_out, B))
+        # Both directions share the similarity q k^T [B, heads, N_img, N_txt]:
+        # softmax over text for the vision update, over pixels for the text one.
+        # Fused attention computes it twice rather than materializing it.
+        text_keep = None if text_pad_mask is None else ~text_pad_mask[:, None, None, :]
+        vision_keep = None if vision_pad_mask is None else ~vision_pad_mask[:, None, None, :]
+        vision_out = F.scaled_dot_product_attention(q, k, v_text, attn_mask=text_keep, scale=1.0)
+        text_out = F.scaled_dot_product_attention(k, q, v_vision, attn_mask=vision_keep, scale=1.0)
+        return self.out_vision_proj(self._merge(vision_out)), self.out_text_proj(self._merge(text_out))
 
 
 class FusionLayer(nn.Module):
@@ -632,8 +635,8 @@ class EncoderLayer(nn.Module):
         )
 
     def forward(self, vision, vision_pos, reference_points, vision_valid, spatial_shapes, spatial_shapes_list,
-                text, text_pos, text_token_mask, text_self_attn_mask):
-        vision, text = self.fusion_layer(vision, text, ~vision_valid, ~text_token_mask)
+                text, text_pos, text_token_mask, text_self_attn_mask, vision_pad_mask, text_pad_mask):
+        vision, text = self.fusion_layer(vision, text, vision_pad_mask, text_pad_mask)
         text = self.text_enhancer_layer(text, text_self_attn_mask[:, None], text_pos)
         vision = self.deformable_layer(
             vision, vision_pos, reference_points, vision_valid, spatial_shapes, spatial_shapes_list
@@ -665,12 +668,16 @@ class Encoder(nn.Module):
         return points[:, :, None] * valid_ratios[:, None]
 
     def forward(self, vision, vision_pos, vision_valid, spatial_shapes, spatial_shapes_list, valid_ratios,
-                text, text_token_mask, text_self_attn_mask, text_position_ids):
+                text, text_token_mask, text_self_attn_mask, text_position_ids, vision_padded=True, text_padded=True):
+        """``vision_padded`` / ``text_padded`` False promise that every pixel /
+        token is valid, so the fusion layers' attention can run unmasked."""
         reference_points = self.reference_points(spatial_shapes_list, valid_ratios, vision.device)
         text_pos = sine_embedding(text_position_ids[..., None], num_pos_feats=text.shape[-1]).to(text.dtype)
+        vision_pad_mask = ~vision_valid if vision_padded else None
+        text_pad_mask = ~text_token_mask if text_padded else None
         for layer in self.layers:
             args = (vision, vision_pos, reference_points, vision_valid, spatial_shapes, spatial_shapes_list,
-                    text, text_pos, text_token_mask, text_self_attn_mask)
+                    text, text_pos, text_token_mask, text_self_attn_mask, vision_pad_mask, text_pad_mask)
             if self.grad_checkpoint and torch.is_grad_enabled():
                 vision, text = torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
             else:
@@ -923,6 +930,24 @@ class GroundingDINO(nn.Module):
     def _box_heads(self):
         return list(self.bbox_embed) * (len(self.decoder.layers) // len(self.bbox_embed))
 
+    def precast_weights(self, dtype=torch.float16):
+        """Store the image path's Linear and Conv2d weights in ``dtype``, for autocast.
+
+        ``torch.autocast(dtype=dtype)`` casts these weights on every call, so
+        storing them cast gives bit-identical outputs without those cast
+        kernels: ~2.4 ms per image for tiny and base on an RTX 5070 Ti, and
+        half the weights' memory. Detection must then run under that autocast
+        (fp32 inputs would meet ``dtype`` weights). BERT is left alone, so
+        :meth:`encode_text` still runs in fp32 outside it. Returns ``self``.
+        """
+        for name, child in self.named_children():
+            if name in ("text_backbone", "text_projection"):
+                continue
+            for module in child.modules():
+                if isinstance(module, (nn.Linear, nn.Conv2d)):
+                    module.to(dtype)
+        return self
+
     # ------------------------------------------------------------------ inputs
 
     def preprocess_image(self, image, size=800, max_size=1333, device=None):
@@ -1057,9 +1082,15 @@ class GroundingDINO(nn.Module):
         spatial_shapes = torch.as_tensor(spatial_shapes_list, dtype=torch.long, device=vision.device)
         valid_ratios = torch.stack([self._valid_ratio(m) for m in masks], 1)
 
+        # The fusion layers' attention runs ~3x faster unmasked, so drop the
+        # masks when nothing is padded (images of one size, one caption). The
+        # check is a sync; a traced graph keeps them, for zero-padded inputs.
+        vision_padded = text_padded = True
+        if not torch.jit.is_tracing():
+            vision_padded, text_padded = (~torch.stack([pixel_mask.all(), text.token_mask.all()])).tolist()
         vision, text_hidden = self.encoder(
             vision, vision_pos, vision_valid, spatial_shapes, spatial_shapes_list, valid_ratios,
-            text.features, text.token_mask, text.self_attn_mask, text.position_ids,
+            text.features, text.token_mask, text.self_attn_mask, text.position_ids, vision_padded, text_padded,
         )
 
         # Two-stage: score every encoder pixel against the text, keep the top 900.
@@ -1068,7 +1099,8 @@ class GroundingDINO(nn.Module):
         enc_coords = self.encoder_output_bbox_embed(object_query) + proposals
         topk = enc_logits.max(-1).values.topk(self.num_queries, dim=1).indices
         reference_points = torch.gather(enc_coords, 1, topk[..., None].expand(-1, -1, 4)).detach().sigmoid()
-        queries = self.query_position_embeddings.weight.unsqueeze(0).expand(B, -1, -1)
+        # Slot i holds the i-th best proposal, so fewer queries keep the best ones.
+        queries = self.query_position_embeddings.weight[: self.num_queries].unsqueeze(0).expand(B, -1, -1)
 
         hidden_states, references = self.decoder(
             queries, reference_points, vision, vision_valid, spatial_shapes, spatial_shapes_list,
@@ -1140,7 +1172,15 @@ class GroundingDINO(nn.Module):
 
         ``phrase_token_indices`` comes from ``Tokenizer.phrase_token_indices``.
         """
-        return torch.stack([pred_logits[..., list(idx)].amax(-1) for idx in phrase_token_indices], dim=-1)
+        # One gather for every phrase rather than an index + amax each (80 for
+        # COCO): phrases are padded to the longest with a -inf column.
+        width = max(len(idx) for idx in phrase_token_indices)
+        pad = pred_logits.shape[-1]
+        index = torch.tensor(
+            [list(idx) + [pad] * (width - len(idx)) for idx in phrase_token_indices], device=pred_logits.device
+        )
+        padded = F.pad(pred_logits, (0, 1), value=float("-inf"))
+        return padded[..., index].amax(-1)
 
 
 if __name__ == "__main__":

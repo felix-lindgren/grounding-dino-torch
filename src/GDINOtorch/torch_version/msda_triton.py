@@ -1,4 +1,4 @@
-"""Triton multi-scale deformable attention with a backward pass, for training.
+"""Triton multi-scale deformable attention, forward for inference and a backward for training.
 
 Same math as ``multi_scale_deformable_attention`` in ``gdino.py`` (bilinear
 sampling at ``loc * size - 0.5``, zeros outside the map), but fused: one
@@ -103,22 +103,27 @@ def _level_tensors(spatial_shapes_list, device):
     return _shape_cache[key]
 
 
+def _forward(value, spatial_shapes_list, loc, wt):
+    B, S, H, D = value.shape
+    _, Q, _, L, P, _ = loc.shape
+    value, loc, wt = value.contiguous(), loc.contiguous(), wt.contiguous()
+    shapes, starts = _level_tensors(spatial_shapes_list, value.device)
+    out = torch.empty(B, Q, H, D, device=value.device, dtype=value.dtype)
+    N = B * Q * H
+    with torch.cuda.device(value.device):  # Triton launches on the current device
+        _fwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, out, N, Q * H, S, H,
+                                              L=L, P=P, D=D, BLOCK=BLOCK)
+    return out
+
+
 class _MSDA(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, value, spatial_shapes_list, loc, wt):
-        B, S, H, D = value.shape
-        _, Q, _, L, P, _ = loc.shape
-        value, loc, wt = value.contiguous(), loc.contiguous(), wt.contiguous()
-        shapes, starts = _level_tensors(spatial_shapes_list, value.device)
-        out = torch.empty(B, Q, H, D, device=value.device, dtype=value.dtype)
-        N = B * Q * H
-        with torch.cuda.device(value.device):  # Triton launches on the current device
-            _fwd_kernel[(triton.cdiv(N, BLOCK),)](value, shapes, starts, loc, wt, out, N, Q * H, S, H,
-                                                  L=L, P=P, D=D, BLOCK=BLOCK)
-        ctx.save_for_backward(value, loc, wt)
+        out = _forward(value, spatial_shapes_list, loc, wt)
+        ctx.save_for_backward(value.contiguous(), loc.contiguous(), wt.contiguous())
         ctx.shapes = spatial_shapes_list
-        return out.view(B, Q, H * D)
+        return out.flatten(2)
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
@@ -139,3 +144,9 @@ class _MSDA(torch.autograd.Function):
 def multi_scale_deformable_attention_triton(value, spatial_shapes_list, sampling_locations, attention_weights):
     """Drop-in for ``multi_scale_deformable_attention``; differentiable, CUDA only."""
     return _MSDA.apply(value, spatial_shapes_list, sampling_locations, attention_weights)
+
+
+def multi_scale_deformable_attention_triton_forward(value, spatial_shapes_list, sampling_locations, attention_weights):
+    """Inference-only forward, no autograd. ``value`` keeps its dtype (fp16 under
+    autocast) and the output takes it; sampling and the weighted sum run in fp32."""
+    return _forward(value, spatial_shapes_list, sampling_locations, attention_weights).flatten(2)
